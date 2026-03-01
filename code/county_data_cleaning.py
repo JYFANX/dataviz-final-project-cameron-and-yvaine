@@ -54,6 +54,8 @@ schools_gdf = gpd.GeoDataFrame(scorecard,
                 crs="EPSG:4326")
 
 schools_gdf.to_csv(os.path.join(derived_path, "schools_gdf.csv"), index=False)
+# save as geojson for spatial operations later
+schools_gdf.to_file(os.path.join(derived_path, "schools.geojson"), driver='GeoJSON')
 
 #=========================
 # County data cleaning
@@ -89,7 +91,7 @@ print("duplicated pairs (should be 0):", len(dup))
 #================================
 # popolation data cleaning(18-24)
 #================================
-data = os.path.join(in_path, "ACSST5Y2023.S0101_2026-02-27T181826","ACSST1Y2023.S0101-Data.csv")
+data = os.path.join(in_path, "ACSST5Y2023.S0101_2026-03-01T093929","ACSST5Y2023.S0101-Data.csv")
 
 populations = pd.read_csv(data, skiprows=[1]).copy()
 
@@ -108,11 +110,6 @@ populations['county_name'] = populations['county_name'].str.strip()
 populations['state_name'] = populations['state_name'].str.strip()
 
 
-populations['county_name'] = (
-    populations['county_name']
-    .str.strip()
-)
-
 # 3. Clean & create a new column for the total population of 18-24 year olds
 # Convert the population columns to numeric, coercing errors to NaN and then converting to Int64
 populations['S0101_C01_018E'] = pd.to_numeric(populations['S0101_C01_018E'], errors='coerce').astype('Int64')
@@ -130,14 +127,6 @@ populations = populations[['county_name', 'state_name', 'population_18_24']]
 
 print(populations.columns)
 
-# 4. Merge the population data with the county geodataframe to get the geoid for each county
-populations = populations.merge(
-    counties_keys[["geoid", "match_name", "state_name"]],
-    left_on=["county_name", "state_name"],
-    right_on=["match_name", "state_name"],
-    how="left",
-    validate="m:1"
-)
 
 # 5. Save the cleaned population data to a new CSV file
 out_file = os.path.join(derived_path, "county_population_18_24_2023.csv")
@@ -157,8 +146,6 @@ mobility[['county_name', 'state']] = (
     mobility['Name'].str.split(',', n=1, expand=True)
 )
 mobility["state"] = mobility["state"].str.strip()
-
-
 mobility['county_name'] = (
     mobility['county_name']
     .str.strip()
@@ -169,17 +156,104 @@ mobility = mobility[['county_name', 'state', 'Frac._in_Top_20%_Based_on_Househol
 # Rename the mobility rate column 
 mobility = mobility.rename(columns={'Frac._in_Top_20%_Based_on_Household_Income_rP_gP_pall': 'mobility_rate'})
 
-# 4. Merge the mobility data with the county geodataframe to get the geoid for each county
-mobility = mobility.merge(
-    counties_keys[["geoid", "match_name", "state"]],
-    left_on=["county_name", "state"],
-    right_on=["match_name", "state"],
-    how="left",
-    validate="m:1"
-)
 
 # 5. Save the cleaned mobility data to a new CSV file
 out_file = os.path.join(derived_path, "mobility_rate.csv")
 mobility.to_csv(out_file, index=False)
 
 #=============================================================================
+#================================
+# Calculating EAS
+#================================
+
+from shapely.geometry import Point
+import pyproj
+import matplotlib.pyplot as plt
+
+# drop counties in U.S. territories
+counties = counties[~counties['state'].isin(['AK', 'HI', 'AS', 'GU', 'MP', 'PR', 'VI'])]
+
+
+MILES_TO_METERS = 1609.344
+RADII_MILES = [25, 50, 75]
+PROJECTED_CRS = "EPSG:5070"   # meters
+
+# -------------------------
+# 1) Read counties (polygons)
+# -------------------------
+derived_path = "data/derived-data"
+counties = gpd.read_file(os.path.join(derived_path, "counties.geojson"))
+
+# Ensure a known CRS (most GeoJSON are EPSG:4326)
+if counties.crs is None:
+    counties = counties.set_crs("EPSG:4326")
+
+# -------------------------
+# 2) Read schools (points)
+# -------------------------
+schools = gpd.read_file(os.path.join(derived_path, "schools.geojson"))  
+
+# -------------------------
+# 3) Project both to meters
+# -------------------------
+counties_p = counties.to_crs(PROJECTED_CRS)
+schools_p = schools.to_crs(PROJECTED_CRS)
+
+# -------------------------
+# 4) County "centroid" points (use representative_point for safety)
+# -------------------------
+county_pts = counties_p.copy()
+county_pts["geometry"] = counties_p.geometry.representative_point()
+county_pts = gpd.GeoDataFrame(county_pts, geometry="geometry", crs=PROJECTED_CRS)
+
+# -------------------------
+# 5) Buffer rings and count schools within each radius
+# -------------------------
+out = counties_p.copy()
+
+for r in RADII_MILES:
+    buf = county_pts.copy()
+    buf["geometry"] = buf.geometry.buffer(r * MILES_TO_METERS)
+    buf = gpd.GeoDataFrame(buf, geometry="geometry", crs=PROJECTED_CRS)
+
+    # spatial join: each school matched to the county buffer it falls within
+    joined = gpd.sjoin(
+        schools_p[["geometry"]],
+        buf[["county_name", "state_name","state","geometry"]],
+        how="inner",
+        predicate="within"
+    )
+
+    counts = joined.groupby(["county_name", "state_name", "state"]).size().rename(f"schools_within_{r}mi")
+    out = out.merge(counts.reset_index(), on=["county_name", "state_name", "state"], how="left")
+
+# fill missing with 0
+for r in RADII_MILES:
+    col = f"schools_within_{r}mi"
+    out[col] = out[col].fillna(0).astype(int)
+
+
+# -------------------------
+# 6) Save derived data outputs
+#   (1) human-readable CSV for EAS calc (NO geometry)
+#   (2) mapping-ready spatial file (WITH geometry)
+# -------------------------
+
+# (1) CSV: drop geometry to avoid "乱码"/Excel错列
+out_csv = out.drop(columns="geometry").copy()
+out_csv.to_csv("data/derived-data/county_school_counts_by_radius.csv", index=False)
+
+# (2) Spatial output for mapping later
+out.to_file(
+    "data/derived-data/county_school_counts_by_radius.gpkg",
+    layer="county_school_counts",
+    driver="GPKG"
+)
+
+# also save as geojson for easy use in web mapping
+out.to_file("data/derived-data/county_school_counts_by_radius.geojson", driver="GeoJSON")
+
+print("Saved:")
+print("- data/derived-data/county_school_counts_by_radius.csv (no geometry)")
+print("- data/derived-data/county_school_counts_by_radius.gpkg (with geometry)")
+print("- data/derived-data/county_school_counts_by_radius.geojson (with geometry)")
