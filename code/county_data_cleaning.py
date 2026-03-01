@@ -359,70 +359,92 @@ plt.close()
 print("Saved: data/derived-data/static_map_eas_50mi.png")
 
 # ===============================================
-# Static Plot 1b: Choropleth map of EAS quintiles (50 miles)
+# Static Plot 1c: Education Deserts (Bottom 20%) + Schools (50 miles)
 # ===============================================
 import geopandas as gpd
 import pandas as pd
 import matplotlib.pyplot as plt
 
-
 COUNTIES_PATH = "data/derived-data/counties.geojson"
 EAS_PATH = "data/derived-data/eas_by_radius.csv"
-OUT_PATH = "data/derived-data/static_map_eas_50mi_quintiles.png"
+SCHOOLS_PATH = "data/derived-data/schools.geojson"   # 你之前保存的
+OUT_PATH = "data/derived-data/static_map_deserts_50mi_with_schools.png"
 
 # 1) Load
 counties_map = gpd.read_file(COUNTIES_PATH)
 eas = pd.read_csv(EAS_PATH)
+schools = gpd.read_file(SCHOOLS_PATH)
 
-# 2) Drop non-CONUS in the BASE MAP (关键！)
+# 2) Keep CONUS only
 counties_map = counties_map[~counties_map["state"].isin(EXCLUDE_STATES)].copy()
+schools = schools[~schools["state"].isin(EXCLUDE_STATES)].copy()
 
-# 3) Merge
-gdf_map = counties_map.merge(
+# 3) Merge EAS onto counties
+gdf = counties_map.merge(
     eas[["county_name", "state_name", "eas_50mi_per10k"]],
     on=["county_name", "state_name"],
     how="left",
     validate="1:1"
 )
 
-# 4) Ensure CRS and crop to CONUS bbox (防止漏网之鱼把画面撑大)
-if gdf_map.crs is None:
-    gdf_map = gdf_map.set_crs("EPSG:4326")
+# 4) Ensure CRS, crop to CONUS bbox (避免画布被撑大)
+if gdf.crs is None:
+    gdf = gdf.set_crs("EPSG:4326")
+if schools.crs is None:
+    schools = schools.set_crs("EPSG:4326")
 
-gdf_ll = gdf_map.to_crs("EPSG:4326")
-# 修复几何（可选但稳）
+gdf_ll = gdf.to_crs("EPSG:4326")
+schools_ll = schools.to_crs("EPSG:4326")
+
+# 几何修复（稳）
 gdf_ll["geometry"] = gdf_ll.geometry.buffer(0)
-# 裁到本土
-gdf_ll = gdf_ll.cx[slice(-125, -66.5), slice(24, 49.5)]
 
-# 5) Quintiles on EAS (50mi)
-# 注意：pd.qcut 遇到大量重复值可能报错，加入 duplicates="drop" 更稳
-gdf_ll["eas50_quintile"] = pd.qcut(
-    gdf_ll["eas_50mi_per10k"],
-    q=5,
-    labels=["Q1 (lowest)", "Q2", "Q3", "Q4", "Q5 (highest)"],
-    duplicates="drop"
+# 本土裁剪
+gdf_ll = gdf_ll.cx[slice(-125, -66.5), slice(24, 49.5)]
+schools_ll = schools_ll.cx[slice(-125, -66.5), slice(24, 49.5)]
+
+# 5) Identify deserts = bottom 20% of EAS (50mi)
+#   用 rank(pct=True) 更稳，不怕重复值太多
+gdf_ll["eas_rank_pct"] = gdf_ll["eas_50mi_per10k"].rank(pct=True, method="average")
+gdf_ll["is_desert"] = gdf_ll["eas_rank_pct"] <= 0.20
+
+deserts = gdf_ll[gdf_ll["is_desert"]].copy()
+
+# 6) Select schools to plot
+#    选项 A：所有学校点（默认）
+schools_plot = schools_ll.copy()
+
+#    选项 B（可选）：只画 broad-access（你前面有 is_broad_access）
+# schools_plot = schools_ll[schools_ll["is_broad_access"] == True].copy()
+
+# 7) 只显示 “落在 desert counties 内”的学校点（更干净）
+#    注意：这里是 “在 county polygon 内”，不是 50-mile 圈内。
+#    （圈内点建议放到 streamlit 动态里做）
+schools_in_deserts = gpd.sjoin(
+    schools_plot,
+    deserts[["county_name", "state_name", "geometry"]],
+    how="inner",
+    predicate="within"
 )
 
-# 6) Plot
+# 8) Plot (report-style)
 fig, ax = plt.subplots(1, 1, figsize=(16, 10))
 
-gdf_ll.plot(
-    column="eas50_quintile",
-    categorical=True,
-    legend=True,
+# base layer
+gdf_ll.plot(ax=ax, color="#efefef", linewidth=0.05, edgecolor="white")
+
+# deserts highlight
+deserts.plot(ax=ax, color="#4a1486", linewidth=0.08, edgecolor="white", alpha=0.95)
+
+# schools points (small + semi-transparent)
+# 注意：matplotlib 点大小用 markersize（不是 s）
+schools_in_deserts.plot(
     ax=ax,
-    linewidth=0.15,
-    edgecolor="white",
-    missing_kwds={"color": "lightgrey", "label": "Missing"},
-    legend_kwds={
-        "title": "EAS quintile (50-mile)",
-        "loc": "lower left",
-        "frameon": True
-    }
+    markersize=6,
+    alpha=0.55
 )
 
-ax.set_title("Education Access Score (EAS) Quintiles, 50-mile radius", fontsize=16, pad=12)
+ax.set_title("Education Deserts (Bottom 20% EAS) and Nearby Institutions, 50-mile definition", fontsize=16, pad=12)
 ax.set_axis_off()
 
 plt.tight_layout()
@@ -430,3 +452,5 @@ plt.savefig(OUT_PATH, dpi=350, bbox_inches="tight")
 plt.close()
 
 print(f"Saved: {OUT_PATH}")
+print("Desert counties:", len(deserts))
+print("Schools shown:", len(schools_in_deserts))    
