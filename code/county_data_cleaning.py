@@ -301,7 +301,7 @@ import numpy as np
 import geopandas as gpd
 import pandas as pd
 
-EXCLUDE_STATES = ['AK', 'HI', 'AS', 'GU', 'MP', 'PR', 'VI']  # 你不想显示的
+EXCLUDE_STATES = ['AK', 'HI', 'AS', 'GU', 'MP', 'PR', 'VI']  # U.S. territories + non-continental states to exclude from the map
 
 counties_map = gpd.read_file("data/derived-data/counties.geojson")
 eas = pd.read_csv("data/derived-data/eas_by_radius.csv")
@@ -357,3 +357,76 @@ plt.savefig("data/derived-data/static_map_eas_50mi.png", dpi=350, bbox_inches="t
 plt.close()
 
 print("Saved: data/derived-data/static_map_eas_50mi.png")
+
+# ===============================================
+# Static Plot 1b: Choropleth map of EAS quintiles (50 miles)
+# ===============================================
+import geopandas as gpd
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+COUNTIES_PATH = "data/derived-data/counties.geojson"
+EAS_PATH = "data/derived-data/eas_by_radius.csv"
+OUT_PATH = "data/derived-data/static_map_eas_50mi_quintiles.png"
+
+# 1) Load
+counties_map = gpd.read_file(COUNTIES_PATH)
+eas = pd.read_csv(EAS_PATH)
+
+# 2) Drop non-CONUS in the BASE MAP (关键！)
+counties_map = counties_map[~counties_map["state"].isin(EXCLUDE_STATES)].copy()
+
+# 3) Merge
+gdf_map = counties_map.merge(
+    eas[["county_name", "state_name", "eas_50mi_per10k"]],
+    on=["county_name", "state_name"],
+    how="left",
+    validate="1:1"
+)
+
+# 4) Ensure CRS and crop to CONUS bbox (防止漏网之鱼把画面撑大)
+if gdf_map.crs is None:
+    gdf_map = gdf_map.set_crs("EPSG:4326")
+
+gdf_ll = gdf_map.to_crs("EPSG:4326")
+# 修复几何（可选但稳）
+gdf_ll["geometry"] = gdf_ll.geometry.buffer(0)
+# 裁到本土
+gdf_ll = gdf_ll.cx[slice(-125, -66.5), slice(24, 49.5)]
+
+# 5) Quintiles on EAS (50mi)
+# 注意：pd.qcut 遇到大量重复值可能报错，加入 duplicates="drop" 更稳
+gdf_ll["eas50_quintile"] = pd.qcut(
+    gdf_ll["eas_50mi_per10k"],
+    q=5,
+    labels=["Q1 (lowest)", "Q2", "Q3", "Q4", "Q5 (highest)"],
+    duplicates="drop"
+)
+
+# 6) Plot
+fig, ax = plt.subplots(1, 1, figsize=(16, 10))
+
+gdf_ll.plot(
+    column="eas50_quintile",
+    categorical=True,
+    legend=True,
+    ax=ax,
+    linewidth=0.15,
+    edgecolor="white",
+    missing_kwds={"color": "lightgrey", "label": "Missing"},
+    legend_kwds={
+        "title": "EAS quintile (50-mile)",
+        "loc": "lower left",
+        "frameon": True
+    }
+)
+
+ax.set_title("Education Access Score (EAS) Quintiles, 50-mile radius", fontsize=16, pad=12)
+ax.set_axis_off()
+
+plt.tight_layout()
+plt.savefig(OUT_PATH, dpi=350, bbox_inches="tight")
+plt.close()
+
+print(f"Saved: {OUT_PATH}")
