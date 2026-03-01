@@ -451,3 +451,156 @@ plt.close()
 print(f"Saved: {OUT_PATH}")
 print("Desert counties:", len(deserts))
 print("Schools shown:", len(schools_in_deserts))    
+
+
+
+# ===============================================
+# Static Plot 2: Scatter (EAS vs Mobility)
+# ===============================================
+import pandas as pd
+import altair as alt
+
+# Paths
+EAS_PATH = "data/derived-data/eas_by_radius.csv"
+MOBILITY_PATH = "data/derived-data/mobility_rate.csv"
+OUT_PATH = "data/derived-data/static_scatter_eas_vs_mobility_50mi.png"
+
+# 1) Load
+eas = pd.read_csv(EAS_PATH)
+mobility = pd.read_csv(MOBILITY_PATH)
+
+#find the duplicated rows in mobility
+dup = mobility[mobility.duplicated(
+    subset=["county_name", "state"],
+    keep=False
+)].sort_values(["county_name", "state"])
+
+print("Number of duplicate rows:", len(dup))
+print("\nDuplicate combinations:")
+print(
+    dup[["county_name", "state"]]
+    .value_counts()
+    .reset_index(name="count")
+    .head(20)
+)
+
+print("\nSample duplicate rows:")
+print(dup.head(20))
+
+# find out the duplicated rows are NA
+mobility = mobility.dropna(subset=["county_name", "state"])
+
+# 2) Merge
+df = eas.merge(
+    mobility,
+    on=["county_name", "state"],
+    how="left",
+    validate="1:1"
+)
+
+# 3) Drop missing
+df = df.dropna(subset=["eas_50mi_per10k", "mobility_rate"])
+
+# 4) log transform EAS if very skewed
+df["log_eas_50mi"] = df["eas_50mi_per10k"].apply(lambda x: 0 if x <= 0 else x).pipe(lambda s: s + 1).apply(lambda x: np.log(x))
+df["is_desert"] = df["eas_50mi_per10k"].rank(pct=True) <= 0.2
+
+# 5) Build Altair chart
+base = alt.Chart(df).encode(
+    x=alt.X("log_eas_50mi:Q", title="log(EAS + 1), 50-mile"),
+    y=alt.Y(
+        "mobility_rate:Q",
+        title="Mobility Rate (Top 20% income)"),
+    color=alt.Color(
+    "is_desert:N",
+    title="Education desert?",
+    scale=alt.Scale(
+        domain=[False, True],
+        range=["#c7c7c7", "#311B92"]
+    )
+)
+)
+    
+
+
+points = base.mark_circle(
+    size=40,
+    opacity=0.4
+)
+
+trend = base.transform_regression(
+    "eas_50mi_per10k",
+    "mobility_rate"
+).mark_line(
+    color="red",
+    size=2
+)
+
+chart = (points + trend).properties(
+    width=700,
+    height=500,
+    title="Education Access vs Intergenerational Mobility (50-mile)"
+)
+
+# 6) Save
+chart.save(OUT_PATH)
+
+print(f"Saved: {OUT_PATH}")
+
+
+import numpy as np
+import altair as alt
+import pandas as pd
+
+#=========================
+# plot
+#=========================
+# ------------------------------------------------
+# 1) 先确保 desert 定义
+# ------------------------------------------------
+df["is_desert"] = df["eas_50mi_per10k"].rank(pct=True) <= 0.2
+
+# ------------------------------------------------
+# 2) 计算 group summary
+# ------------------------------------------------
+summary = (
+    df.groupby("is_desert")["mobility_rate"]
+    .agg(["mean", "count", "std"])
+    .reset_index()
+)
+
+summary["se"] = summary["std"] / np.sqrt(summary["count"])
+summary["ci_low"] = summary["mean"] - 1.96 * summary["se"]
+summary["ci_high"] = summary["mean"] + 1.96 * summary["se"]
+
+# ------------------------------------------------
+# 3) Plot
+# ------------------------------------------------
+base = alt.Chart(summary).encode(
+    x=alt.X("is_desert:N", title="Education Desert"),
+)
+
+bars = base.mark_bar(size=80).encode(
+    y=alt.Y("mean:Q", title="Average Mobility Rate (Top 20%)"),
+    color=alt.Color(
+        "is_desert:N",
+        scale=alt.Scale(
+            domain=[False, True],
+            range=["#bdbdbd", "#311B92"]  # 灰 vs 深紫
+        ),
+        legend=None
+    )
+)
+
+error = base.mark_rule(color="black", strokeWidth=2).encode(
+    y="ci_low:Q",
+    y2="ci_high:Q"
+)
+
+chart = (bars + error).properties(
+    width=450,
+    height=500,
+    title="Mobility is Lower in Education Desert Counties"
+)
+
+chart
