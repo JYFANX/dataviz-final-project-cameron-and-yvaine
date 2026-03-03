@@ -134,32 +134,36 @@ populations.to_csv(out_file, index=False)
 
 
 #================================
-# mobility rate data cleaning
+# median income data cleaning
 #================================
 # load the mobility data
-data = os.path.join(in_path, "cty_kfr_top20_rP_gP_pall.csv")
-mobility = gpd.read_file(data)
+data = os.path.join(in_path, "ACSDT5Y2023.B19013_2026-03-02T221821","ACSDT5Y2023.B19013-Data.csv")
+median_income= pd.read_csv(data, skiprows=[1]).copy()
 
 # 2. Split the NAME column into county_name and state
-mobility['Name'] = mobility['Name'].astype(str)
-mobility[['county_name', 'state']] = (
-    mobility['Name'].str.split(',', n=1, expand=True)
+
+median_income = median_income[['NAME', 'B19013_001E']]
+
+# 2. Split the NAME column into county_name and state
+median_income['NAME'] = median_income['NAME'].astype(str)
+median_income[['county_name', 'state_name']] = (
+    median_income['NAME'].str.split(',', n=1, expand=True)
 )
-mobility["state"] = mobility["state"].str.strip()
-mobility['county_name'] = (
-    mobility['county_name']
-    .str.strip()
-)
 
-# 3. Only keep the columns we need and rename the mobility rate column for clarity
-mobility = mobility[['county_name', 'state', 'Frac._in_Top_20%_Based_on_Household_Income_rP_gP_pall']]
-# Rename the mobility rate column 
-mobility = mobility.rename(columns={'Frac._in_Top_20%_Based_on_Household_Income_rP_gP_pall': 'mobility_rate'})
+# Strip leading/trailing whitespace from county_name and state
+median_income['county_name'] = median_income['county_name'].str.strip()
+median_income['state_name'] = median_income['state_name'].str.strip()
 
 
-# 5. Save the cleaned mobility data to a new CSV file
-out_file = os.path.join(derived_path, "mobility_rate.csv")
-mobility.to_csv(out_file, index=False)
+# 3. Only keep the columns we need and rename the median income column for clarity
+median_income = median_income[['county_name', 'state_name', 'B19013_001E']]
+# Rename the median income column 
+median_income = median_income.rename(columns={'B19013_001E': 'median_income'})
+
+
+# 5. Save the cleaned median income data to a new CSV file
+out_file = os.path.join(derived_path, "median_income.csv")
+median_income.to_csv(out_file, index=False)
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
@@ -374,6 +378,7 @@ OUT_PATH = "data/derived-data/static_map_deserts_50mi_with_schools.png"
 counties_map = gpd.read_file(COUNTIES_PATH)
 eas = pd.read_csv(EAS_PATH)
 schools = gpd.read_file(SCHOOLS_PATH)
+counts = pd.read_csv("data/derived-data/county_school_counts_by_radius.csv")
 
 # 2) Keep CONUS only
 counties_map = counties_map[~counties_map["state"].isin(EXCLUDE_STATES)].copy()
@@ -382,6 +387,14 @@ schools = schools[~schools["state"].isin(EXCLUDE_STATES)].copy()
 # 3) Merge EAS onto counties
 gdf = counties_map.merge(
     eas[["county_name", "state_name", "eas_50mi_per10k"]],
+    on=["county_name", "state_name"],
+    how="left",
+    validate="1:1"
+)
+
+# merge school counts（bring schools_wthin_50mi）
+gdf = gdf.merge(
+    counts[["county_name", "state_name", "schools_within_50mi"]],
     on=["county_name", "state_name"],
     how="left",
     validate="1:1"
@@ -406,9 +419,12 @@ schools_ll = schools_ll.cx[slice(-125, -66.5), slice(24, 49.5)]
 # 5) Identify deserts = bottom 20% of EAS (50mi)
 #   rank(pct=True) 
 gdf_ll["eas_rank_pct"] = gdf_ll["eas_50mi_per10k"].rank(pct=True, method="average")
-gdf_ll["is_desert"] = gdf_ll["eas_rank_pct"] <= 0.20
+gdf_ll["is_desert"] = (gdf_ll["eas_rank_pct"] <= 0.20) & (gdf_ll["schools_within_50mi"] <= 2)
 
 deserts = gdf_ll[gdf_ll["is_desert"]].copy()
+flag = gdf_ll[["county_name", "state_name", "state", "is_desert"]].copy()
+flag.to_csv("data/derived-data/county_desert_flag.csv", index=False)
+print("Saved: data/derived-data/county_desert_flag.csv")
 
 # 6) Select schools to plot
 #    only plot schools that fall within desert counties or within 50 miles of them (for better visibility)
@@ -435,10 +451,10 @@ deserts.plot(ax=ax, color="#4a1486", linewidth=0.08, edgecolor="white", alpha=0.
 # schools points (small + semi-transparent)
 schools_in_deserts.plot(
     ax=ax,
-    markersize=3,
+    markersize=7,
     color="#FFD700",        # golden color for better visibility
     linewidth=0.3,
-    alpha=0.6
+    alpha=0.9
 )
 
 ax.set_title("Education Deserts (Bottom 20% EAS) and Nearby Institutions, 50-mile definition", fontsize=16, pad=12)
@@ -490,7 +506,7 @@ print(dup.head(20))
 # find out the duplicated rows are NA
 mobility = mobility.dropna(subset=["county_name", "state"])
 
-# 2) Merge
+# 2) Merge EAS and mobility data on county_name and state
 df = eas.merge(
     mobility,
     on=["county_name", "state"],
@@ -498,12 +514,25 @@ df = eas.merge(
     validate="1:1"
 )
 
+
+#  is_desert flag
+deserts_flag = pd.read_csv("data/derived-data/county_desert_flag.csv")
+
+# merge the desert flag onto df
+df = df.merge(
+    deserts_flag[["county_name", "state", "is_desert"]],
+    on=["county_name", "state"],
+    how="left"
+)
+
+# fill missing desert flag with False (assume missing means not a desert, since we only flagged the bottom 20%)
+df["is_desert"] = df["is_desert"].fillna(False)
+
 # 3) Drop missing
 df = df.dropna(subset=["eas_50mi_per10k", "mobility_rate"])
 
 # 4) log transform EAS if very skewed
 df["log_eas_50mi"] = df["eas_50mi_per10k"].apply(lambda x: 0 if x <= 0 else x).pipe(lambda s: s + 1).apply(lambda x: np.log(x))
-df["is_desert"] = df["eas_50mi_per10k"].rank(pct=True) <= 0.2
 
 # 5) Build Altair chart
 base = alt.Chart(df).encode(
@@ -529,7 +558,7 @@ points = base.mark_circle(
 )
 
 trend = base.transform_regression(
-    "eas_50mi_per10k",
+    "log_eas_50mi",
     "mobility_rate"
 ).mark_line(
     color="red",
@@ -553,13 +582,25 @@ import altair as alt
 import pandas as pd
 
 #=========================
-# plot
+# plot not sure
 #=========================
-# ------------------------------------------------
-# 1) 先确保 desert 定义
-# ------------------------------------------------
-df["is_desert"] = df["eas_50mi_per10k"].rank(pct=True) <= 0.2
+# 1. 确保你已经读取了刚才保存的 desert_flag 文件
+desert_flags = pd.read_csv("data/derived-data/county_desert_flag.csv")
 
+# 2. 读取流动率数据 (mobility_rate)
+mobility_df = pd.read_csv("data/derived-data/mobility_rate.csv")
+
+# 3. 将两者合并到 df 中
+# 注意：你的 mobility 数据里列名是 'state'，而 flag 数据里是 'state'，确保 merge 键一致
+df = mobility_df.merge(
+    desert_flags[["county_name", "state_name", "is_desert"]],
+    on=["county_name"], # 如果 mobility 数据里没有 state_name，先用 county_name 试探
+    how="inner"
+)
+
+# 4. 现在再执行 groupby 就不会报错了
+result = df.groupby("is_desert")["mobility_rate"].mean()
+print(result)
 # ------------------------------------------------
 # 2) 计算 group summary
 # ------------------------------------------------
