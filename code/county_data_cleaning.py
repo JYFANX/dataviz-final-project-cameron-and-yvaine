@@ -614,3 +614,223 @@ chart = alt.Chart(df).mark_boxplot().encode(
 ).properties(width=450, height=400, title="Percent Bachelor's Degree or Higher: Deserts vs Non-deserts")
 
 chart.save("data/derived-data/static_box_degree_desert.png")
+
+
+#================================
+# Streamlit
+#================================
+import streamlit as st
+import pandas as pd
+import geopandas as gpd
+import numpy as np
+import pydeck as pdk
+from shapely.geometry import mapping
+
+# -----------------------------
+# Config
+# -----------------------------
+st.set_page_config(page_title="Education Access Map", layout="wide")
+
+COUNTIES_PATH = "data/derived-data/counties.geojson"
+SCHOOLS_PATH = "data/derived-data/schools.geojson"
+COUNTS_PATH = "data/derived-data/county_school_counts_by_radius.csv"
+
+PROJECTED_CRS = "EPSG:5070"  # meters
+WGS84 = "EPSG:4326"
+MILES_TO_METERS = 1609.344
+RADII = [25, 50, 75]
+EXCLUDE_STATES = ['AK', 'HI', 'AS', 'GU', 'MP', 'PR', 'VI']
+
+# -----------------------------
+# Load data (cache)
+# -----------------------------
+@st.cache_data
+def load_data():
+    counties = gpd.read_file(COUNTIES_PATH)
+    schools = gpd.read_file(SCHOOLS_PATH)
+    counts = pd.read_csv(COUNTS_PATH)
+
+    # Clean filters (CONUS only)
+    counties = counties[~counties["state"].isin(EXCLUDE_STATES)].copy()
+    schools = schools[~schools["state"].isin(EXCLUDE_STATES)].copy()
+
+    # Ensure CRS
+    if counties.crs is None:
+        counties = counties.set_crs(WGS84)
+    if schools.crs is None:
+        schools = schools.set_crs(WGS84)
+
+    # merge counts onto counties
+    counties = counties.merge(
+        counts,
+        on=["county_name", "state_name", "state"],
+        how="left",
+        validate="1:1"
+    )
+
+    return counties, schools
+
+counties_ll, schools_ll = load_data()
+
+# Add a user-friendly county label
+counties_ll["county_label"] = counties_ll["county_name"] + ", " + counties_ll["state"]
+
+# -----------------------------
+# Sidebar controls
+# -----------------------------
+st.sidebar.header("Controls")
+
+county_label = st.sidebar.selectbox(
+    "Select a county",
+    options=sorted(counties_ll["county_label"].dropna().unique().tolist())
+)
+
+radius_mi = st.sidebar.radio(
+    "Radius (miles)",
+    options=RADII,
+    index=1,  # default 50
+    horizontal=True
+)
+
+# pull selected county row
+county_row = counties_ll.loc[counties_ll["county_label"] == county_label].iloc[0:1].copy()
+county_geom_ll = county_row.geometry.iloc[0]
+
+# -----------------------------
+# Build buffer circle + schools within buffer
+# -----------------------------
+# project for accurate distance buffers
+county_gdf_p = gpd.GeoDataFrame(county_row, geometry="geometry", crs=WGS84).to_crs(PROJECTED_CRS)
+schools_p = schools_ll.to_crs(PROJECTED_CRS)
+
+# representative point (more robust than centroid for weird shapes)
+rep_pt = county_gdf_p.geometry.representative_point().iloc[0]
+
+buffer_poly_p = rep_pt.buffer(radius_mi * MILES_TO_METERS)
+buffer_poly_ll = gpd.GeoSeries([buffer_poly_p], crs=PROJECTED_CRS).to_crs(WGS84).iloc[0]
+
+# schools inside buffer
+buf_gdf_p = gpd.GeoDataFrame(geometry=[buffer_poly_p], crs=PROJECTED_CRS)
+schools_in = gpd.sjoin(
+    schools_p,
+    buf_gdf_p,
+    how="inner",
+    predicate="within"
+).copy()
+
+schools_in_ll = schools_in.to_crs(WGS84)
+
+# counts (two ways: from sjoin, and from precomputed column)
+count_live = len(schools_in_ll)
+col_pre = f"schools_within_{radius_mi}mi"
+count_pre = int(county_row[col_pre].fillna(0).iloc[0]) if col_pre in county_row.columns else None
+
+# -----------------------------
+# Header metrics
+# -----------------------------
+st.title("Education Access Explorer")
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Selected county", county_label)
+c2.metric(f"Schools within {radius_mi} miles (live spatial)", f"{count_live}")
+if count_pre is not None:
+    c3.metric(f"Schools within {radius_mi} miles (precomputed)", f"{count_pre}")
+else:
+    c3.metric("Schools within radius (precomputed)", "N/A")
+
+st.caption("Tip: You can zoom/pan the map. The circle is centered at a representative point of the county.")
+
+# -----------------------------
+# Prepare GeoJSON for Pydeck
+# -----------------------------
+county_geojson = {
+    "type": "FeatureCollection",
+    "features": [{
+        "type": "Feature",
+        "geometry": mapping(county_geom_ll),
+        "properties": {"name": county_label}
+    }]
+}
+
+buffer_geojson = {
+    "type": "FeatureCollection",
+    "features": [{
+        "type": "Feature",
+        "geometry": mapping(buffer_poly_ll),
+        "properties": {"radius_mi": radius_mi}
+    }]
+}
+
+schools_points = schools_in_ll.copy()
+# ensure lon/lat columns exist for pydeck
+schools_points["lon"] = schools_points.geometry.x
+schools_points["lat"] = schools_points.geometry.y
+
+# map center = representative point (in WGS84)
+rep_pt_ll = gpd.GeoSeries([rep_pt], crs=PROJECTED_CRS).to_crs(WGS84).iloc[0]
+center_lat = rep_pt_ll.y
+center_lon = rep_pt_ll.x
+
+# -----------------------------
+# Pydeck layers
+# -----------------------------
+layer_county = pdk.Layer(
+    "GeoJsonLayer",
+    data=county_geojson,
+    stroked=True,
+    filled=False,
+    lineWidthMinPixels=2,
+)
+
+layer_buffer = pdk.Layer(
+    "GeoJsonLayer",
+    data=buffer_geojson,
+    stroked=True,
+    filled=True,
+    getFillColor=[80, 160, 240, 40],   # light transparent
+    getLineColor=[80, 160, 240, 200],
+    lineWidthMinPixels=2,
+)
+
+layer_schools = pdk.Layer(
+    "ScatterplotLayer",
+    data=schools_points,
+    get_position=["lon", "lat"],
+    get_radius=250,     # meters-ish visual size, not exact; adjust if you want
+    pickable=True,
+)
+
+tooltip = {
+    "html": "<b>{school_name}</b><br/>"
+            "City: {city}<br/>"
+            "State: {state}<br/>"
+            "Admit rate: {admit_rate}",
+    "style": {"backgroundColor": "white", "color": "black"}
+}
+
+view_state = pdk.ViewState(
+    latitude=center_lat,
+    longitude=center_lon,
+    zoom=7,   # default zoom; user can zoom in/out
+    pitch=0
+)
+
+deck = pdk.Deck(
+    layers=[layer_county, layer_buffer, layer_schools],
+    initial_view_state=view_state,
+    tooltip=tooltip,
+)
+
+st.pydeck_chart(deck, use_container_width=True)
+
+# -----------------------------
+# Optional: table of schools in radius
+# -----------------------------
+with st.expander(f"Show schools within {radius_mi} miles (table)"):
+    cols_show = ["school_name", "city", "state", "admit_rate", "pell_grant_rate", "median_earnings"]
+    cols_show = [c for c in cols_show if c in schools_in_ll.columns]
+    st.dataframe(
+        schools_in_ll[cols_show].sort_values(by=["state", "city"], na_position="last"),
+        use_container_width=True,
+        hide_index=True
+    )
